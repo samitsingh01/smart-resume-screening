@@ -1,10 +1,7 @@
-# backend/app/workflows/resume_processing.py
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from typing_extensions import TypedDict, Annotated
-from typing import List, Dict, Any
 import logging
+from typing import Dict, Any, List
 from datetime import datetime
+import traceback
 
 from app.services.nlp_service import NLPService
 from app.services.vector_service import VectorService
@@ -13,233 +10,230 @@ from app.models.database import Resume, ProcessingLog
 
 logger = logging.getLogger(__name__)
 
-class ResumeProcessingState(TypedDict):
-    resume_id: str
-    filename: str
-    raw_content: str
-    processed_content: str
-    extracted_data: Dict[str, Any]
-    skills: List[str]
-    experience_data: Dict[str, Any]
-    quality_metrics: Dict[str, float]
-    embeddings: List[float]
-    status: str
-    errors: List[str]
-    processing_time: float
-
 class ResumeProcessingWorkflow:
     def __init__(self):
-        self.nlp_service = NLPService()
-        self.vector_service = VectorService()
-        self.graph = self._build_graph()
+        self.nlp_service = None
+        self.vector_service = None
 
-    def _build_graph(self) -> StateGraph:
-        """Build the resume processing workflow graph"""
-        workflow = StateGraph(ResumeProcessingState)
-        
-        # Add nodes
-        workflow.add_node("extract_text", self._extract_text)
-        workflow.add_node("clean_content", self._clean_content)
-        workflow.add_node("extract_skills", self._extract_skills)
-        workflow.add_node("extract_experience", self._extract_experience)
-        workflow.add_node("extract_education", self._extract_education)
-        workflow.add_node("calculate_quality", self._calculate_quality)
-        workflow.add_node("generate_embeddings", self._generate_embeddings)
-        workflow.add_node("save_to_database", self._save_to_database)
-        workflow.add_node("handle_error", self._handle_error)
-        
-        # Define edges
-        workflow.add_edge(START, "extract_text")
-        workflow.add_edge("extract_text", "clean_content")
-        workflow.add_edge("clean_content", "extract_skills")
-        workflow.add_edge("extract_skills", "extract_experience")
-        workflow.add_edge("extract_experience", "extract_education")
-        workflow.add_edge("extract_education", "calculate_quality")
-        workflow.add_edge("calculate_quality", "generate_embeddings")
-        workflow.add_edge("generate_embeddings", "save_to_database")
-        workflow.add_edge("save_to_database", END)
-        workflow.add_edge("handle_error", END)
-        
-        return workflow.compile()
+    async def initialize(self):
+        """Initialize the workflow services"""
+        try:
+            self.nlp_service = NLPService()
+            self.vector_service = VectorService()
+            await self.vector_service.initialize()
+        except Exception as e:
+            logger.warning(f"Workflow initialization partial failure: {e}")
 
     async def process_resume(self, resume_id: str, filename: str, raw_content: str) -> Dict[str, Any]:
-        """Process a resume through the workflow"""
+        """Process a resume through simplified workflow"""
         start_time = datetime.utcnow()
         
-        initial_state = ResumeProcessingState(
-            resume_id=resume_id,
-            filename=filename,
-            raw_content=raw_content,
-            processed_content="",
-            extracted_data={},
-            skills=[],
-            experience_data={},
-            quality_metrics={},
-            embeddings=[],
-            status="processing",
-            errors=[],
-            processing_time=0.0
-        )
+        result = {
+            "resume_id": resume_id,
+            "filename": filename,
+            "status": "processing",
+            "errors": [],
+            "processing_time": 0.0
+        }
+        
+        db = next(get_db())
         
         try:
-            result = await self.graph.ainvoke(initial_state)
-            result["processing_time"] = (datetime.utcnow() - start_time).total_seconds()
-            return result
-        except Exception as e:
-            logger.error(f"Error processing resume {resume_id}: {e}")
-            return await self._handle_error({**initial_state, "errors": [str(e)]})
-
-    async def _extract_text(self, state: ResumeProcessingState) -> ResumeProcessingState:
-        """Extract and clean text from raw content"""
-        try:
-            # Basic text cleaning
-            content = state["raw_content"]
-            # Remove excessive whitespace
-            content = " ".join(content.split())
-            # Remove special characters but keep important punctuation
-            import re
-            content = re.sub(r'[^\w\s\-\.\@\(\)]', ' ', content)
-            
-            state["processed_content"] = content
-            logger.info(f"Text extracted for resume {state['resume_id']}")
-            return state
-        except Exception as e:
-            state["errors"].append(f"Text extraction failed: {e}")
-            return state
-
-    async def _clean_content(self, state: ResumeProcessingState) -> ResumeProcessingState:
-        """Clean and normalize content"""
-        try:
-            content = await self.nlp_service.clean_text(state["processed_content"])
-            state["processed_content"] = content
-            return state
-        except Exception as e:
-            state["errors"].append(f"Content cleaning failed: {e}")
-            return state
-
-    async def _extract_skills(self, state: ResumeProcessingState) -> ResumeProcessingState:
-        """Extract skills from resume content"""
-        try:
-            skills = await self.nlp_service.extract_skills(state["processed_content"])
-            state["skills"] = skills
-            state["extracted_data"]["skills"] = skills
-            return state
-        except Exception as e:
-            state["errors"].append(f"Skill extraction failed: {e}")
-            return state
-
-    async def _extract_experience(self, state: ResumeProcessingState) -> ResumeProcessingState:
-        """Extract experience information"""
-        try:
-            experience_data = await self.nlp_service.extract_experience(state["processed_content"])
-            state["experience_data"] = experience_data
-            state["extracted_data"]["experience"] = experience_data
-            return state
-        except Exception as e:
-            state["errors"].append(f"Experience extraction failed: {e}")
-            return state
-
-    async def _extract_education(self, state: ResumeProcessingState) -> ResumeProcessingState:
-        """Extract education information"""
-        try:
-            education_data = await self.nlp_service.extract_education(state["processed_content"])
-            state["extracted_data"]["education"] = education_data
-            return state
-        except Exception as e:
-            state["errors"].append(f"Education extraction failed: {e}")
-            return state
-
-    async def _calculate_quality(self, state: ResumeProcessingState) -> ResumeProcessingState:
-        """Calculate resume quality metrics"""
-        try:
-            quality_metrics = await self.nlp_service.calculate_quality_score(
-                state["processed_content"],
-                state["skills"],
-                state["experience_data"]
-            )
-            state["quality_metrics"] = quality_metrics
-            return state
-        except Exception as e:
-            state["errors"].append(f"Quality calculation failed: {e}")
-            return state
-
-    async def _generate_embeddings(self, state: ResumeProcessingState) -> ResumeProcessingState:
-        """Generate embeddings for the resume"""
-        try:
-            embeddings = await self.vector_service.generate_embeddings(state["processed_content"])
-            state["embeddings"] = embeddings
-            return state
-        except Exception as e:
-            state["errors"].append(f"Embedding generation failed: {e}")
-            return state
-
-    async def _save_to_database(self, state: ResumeProcessingState) -> ResumeProcessingState:
-        """Save processed data to database"""
-        try:
-            db = next(get_db())
-            
-            # Update resume record
-            resume = db.query(Resume).filter(Resume.id == state["resume_id"]).first()
+            # Update status to processing
+            resume = db.query(Resume).filter(Resume.id == resume_id).first()
             if resume:
-                resume.processed_content = state["processed_content"]
-                resume.extracted_skills = state["skills"]
-                resume.experience_level = state["experience_data"].get("level", "")
-                resume.experience_years = state["experience_data"].get("years", 0)
-                resume.education = state["extracted_data"].get("education", {})
-                resume.quality_score = state["quality_metrics"].get("overall_score", 0.0)
-                resume.processing_status = "completed"
-                resume.embedding_status = "completed"
+                resume.processing_status = "processing"
+                db.commit()
+            
+            # Step 1: Clean and process content
+            processed_content = self._clean_content(raw_content)
+            
+            # Step 2: Extract skills (with fallback)
+            skills = []
+            if self.nlp_service:
+                try:
+                    skills = await self.nlp_service.extract_skills(processed_content)
+                except Exception as e:
+                    logger.warning(f"NLP skill extraction failed: {e}")
+                    skills = self._extract_skills_fallback(processed_content)
+            else:
+                skills = self._extract_skills_fallback(processed_content)
+            
+            # Step 3: Extract experience (with fallback)
+            experience_data = {}
+            if self.nlp_service:
+                try:
+                    experience_data = await self.nlp_service.extract_experience(processed_content)
+                except Exception as e:
+                    logger.warning(f"NLP experience extraction failed: {e}")
+                    experience_data = self._extract_experience_fallback(processed_content)
+            else:
+                experience_data = self._extract_experience_fallback(processed_content)
+            
+            # Step 4: Calculate quality score
+            quality_score = self._calculate_basic_quality(processed_content, skills, experience_data)
+            
+            # Step 5: Generate embeddings (if service available)
+            if self.vector_service:
+                try:
+                    metadata = {
+                        "resume_id": resume_id,
+                        "filename": filename,
+                        "skills": skills,
+                        "experience_level": experience_data.get("level", ""),
+                    }
+                    await self.vector_service.store_resume_embeddings(resume_id, processed_content, metadata)
+                except Exception as e:
+                    logger.warning(f"Vector embedding failed: {e}")
+                    result["errors"].append(f"Embedding generation failed: {e}")
+            
+            # Step 6: Update database
+            if resume:
+                resume.processed_content = processed_content
+                resume.extracted_skills = skills
+                resume.experience_level = experience_data.get("level", "")
+                resume.experience_years = experience_data.get("years", 0)
+                resume.quality_score = quality_score
+                resume.processing_status = "completed" if not result["errors"] else "partial"
+                resume.embedding_status = "completed" if self.vector_service else "failed"
                 
                 db.commit()
             
-            # Save processing log
+            # Log success
+            processing_time = (datetime.utcnow() - start_time).total_seconds()
             log = ProcessingLog(
                 entity_type="resume",
-                entity_id=state["resume_id"],
+                entity_id=resume_id,
                 operation="full_processing",
-                status="success" if not state["errors"] else "partial_success",
-                details=state["extracted_data"],
-                processing_time=state["processing_time"]
+                status="success" if not result["errors"] else "partial_success",
+                details={
+                    "skills_count": len(skills),
+                    "experience_level": experience_data.get("level", ""),
+                    "quality_score": quality_score
+                },
+                processing_time=processing_time
             )
             db.add(log)
             db.commit()
             
-            state["status"] = "completed"
-            return state
+            result["status"] = "completed"
+            result["processing_time"] = processing_time
+            
+            logger.info(f"Resume {resume_id} processed successfully")
+            
         except Exception as e:
-            state["errors"].append(f"Database save failed: {e}")
-            return state
-        finally:
-            db.close()
-
-    async def _handle_error(self, state: ResumeProcessingState) -> ResumeProcessingState:
-        """Handle processing errors"""
-        try:
-            db = next(get_db())
+            logger.error(f"Error processing resume {resume_id}: {e}")
+            logger.error(traceback.format_exc())
+            
+            result["errors"].append(str(e))
+            result["status"] = "failed"
             
             # Update resume status
-            resume = db.query(Resume).filter(Resume.id == state["resume_id"]).first()
-            if resume:
-                resume.processing_status = "failed"
+            try:
+                if resume:
+                    resume.processing_status = "failed"
+                    db.commit()
+                
+                # Log error
+                processing_time = (datetime.utcnow() - start_time).total_seconds()
+                log = ProcessingLog(
+                    entity_type="resume",
+                    entity_id=resume_id,
+                    operation="full_processing",
+                    status="failed",
+                    error_message=str(e),
+                    processing_time=processing_time
+                )
+                db.add(log)
                 db.commit()
-            
-            # Log error
-            log = ProcessingLog(
-                entity_type="resume",
-                entity_id=state["resume_id"],
-                operation="full_processing",
-                status="failed",
-                error_message="; ".join(state["errors"]),
-                processing_time=state["processing_time"]
-            )
-            db.add(log)
-            db.commit()
-            
-            state["status"] = "failed"
-            return state
-        except Exception as e:
-            logger.error(f"Error handling failed: {e}")
-            return state
+                
+            except Exception as db_error:
+                logger.error(f"Failed to log error to database: {db_error}")
+        
         finally:
             db.close()
+        
+        return result
 
+    def _clean_content(self, content: str) -> str:
+        """Basic content cleaning"""
+        import re
+        # Remove excessive whitespace
+        content = re.sub(r'\s+', ' ', content)
+        # Remove special characters but keep important ones
+        content = re.sub(r'[^\w\s\-\.\@\(\)]', ' ', content)
+        return content.strip()
+
+    def _extract_skills_fallback(self, content: str) -> List[str]:
+        """Fallback skill extraction using pattern matching"""
+        common_skills = [
+            'Python', 'Java', 'JavaScript', 'React', 'Node.js', 'SQL', 'AWS', 'Docker',
+            'Kubernetes', 'Git', 'HTML', 'CSS', 'MongoDB', 'PostgreSQL', 'Linux',
+            'Machine Learning', 'Deep Learning', 'TensorFlow', 'PyTorch', 'Pandas',
+            'FastAPI', 'Django', 'Flask', 'Vue.js', 'Angular', 'TypeScript', 'GraphQL',
+            'Redis', 'Elasticsearch', 'Jenkins', 'CI/CD', 'Terraform', 'Ansible',
+            'Microservices', 'REST API', 'OAuth', 'JWT', 'NGINX', 'Apache', 'DevOps'
+        ]
+        
+        found_skills = []
+        content_lower = content.lower()
+        
+        for skill in common_skills:
+            if skill.lower() in content_lower:
+                found_skills.append(skill)
+        
+        return found_skills[:15]  # Limit to 15 skills
+
+    def _extract_experience_fallback(self, content: str) -> Dict[str, Any]:
+        """Fallback experience extraction using pattern matching"""
+        import re
+        
+        content_lower = content.lower()
+        
+        # Try to find years of experience
+        years = 0
+        year_patterns = [
+            r'(\d+)\+?\s*years?\s*of\s*experience',
+            r'(\d+)\+?\s*years?\s*experience',
+            r'experience\s*:\s*(\d+)\+?\s*years?',
+        ]
+        
+        for pattern in year_patterns:
+            matches = re.findall(pattern, content_lower)
+            if matches:
+                years = max(int(match) for match in matches)
+                break
+        
+        # Determine level based on years and keywords
+        if years >= 7 or any(word in content_lower for word in ['senior', 'lead', 'principal', 'architect']):
+            level = 'senior'
+        elif years >= 3 or any(word in content_lower for word in ['mid-level', 'intermediate']):
+            level = 'mid'
+        else:
+            level = 'entry'
+        
+        return {
+            "years": years,
+            "level": level,
+            "positions": [],
+            "companies": []
+        }
+
+    def _calculate_basic_quality(self, content: str, skills: List[str], experience_data: Dict[str, Any]) -> float:
+        """Calculate basic resume quality score"""
+        score = 0.0
+        
+        # Content length score (0-0.3)
+        content_score = min(len(content) / 2000, 1.0) * 0.3
+        score += content_score
+        
+        # Skills score (0-0.4)
+        skills_score = min(len(skills) / 10, 1.0) * 0.4
+        score += skills_score
+        
+        # Experience score (0-0.3)
+        experience_years = experience_data.get("years", 0)
+        experience_score = min(experience_years / 8, 1.0) * 0.3
+        score += experience_score
+        
+        return round(min(score, 1.0), 2)

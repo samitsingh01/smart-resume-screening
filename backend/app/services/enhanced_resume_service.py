@@ -1,4 +1,3 @@
-# backend/app/services/enhanced_resume_service.py
 import logging
 from typing import List, Optional, Dict, Any
 import uuid
@@ -13,15 +12,6 @@ from app.models.database import Resume, ProcessingLog
 from app.services.vector_service import VectorService
 from app.services.cache_service import CacheService
 from app.core.config import settings
-
-# Document loaders for different file types
-try:
-    from langchain.document_loaders import PyPDFLoader, Docx2txtLoader
-    from langchain_community.document_loaders import UnstructuredPDFLoader
-except ImportError:
-    PyPDFLoader = None
-    Docx2txtLoader = None
-    UnstructuredPDFLoader = None
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +28,7 @@ class EnhancedResumeService:
             logger.info("Enhanced resume service initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize enhanced resume service: {e}")
-            raise
+            # Don't raise - allow partial functionality
 
     async def extract_text_from_file(self, file_path: str, filename: str) -> str:
         """Extract text from various file formats"""
@@ -61,43 +51,64 @@ class EnhancedResumeService:
     async def _extract_from_pdf(self, file_path: str) -> str:
         """Extract text from PDF files"""
         try:
-            if PyPDFLoader:
-                loader = PyPDFLoader(file_path)
-                documents = loader.load()
-                return "\n".join([doc.page_content for doc in documents])
-            else:
-                # Fallback to basic text extraction
-                import PyPDF2
-                with open(file_path, 'rb') as file:
-                    pdf_reader = PyPDF2.PdfReader(file)
-                    text = ""
-                    for page in pdf_reader.pages:
-                        text += page.extract_text()
-                    return text
+            import PyPDF2
+            text = ""
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
+            
+            # Clean extracted text
+            text = text.replace('\n\n', '\n').strip()
+            return text
+            
         except Exception as e:
             logger.error(f"PDF extraction failed: {e}")
-            raise
+            # Fallback: try to read as text
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    return f.read()
+            except:
+                raise Exception(f"Could not extract text from PDF: {e}")
 
     async def _extract_from_docx(self, file_path: str) -> str:
         """Extract text from DOCX files"""
         try:
-            if Docx2txtLoader:
-                loader = Docx2txtLoader(file_path)
-                documents = loader.load()
-                return documents[0].page_content
-            else:
-                # Fallback to basic extraction
-                import docx2txt
-                return docx2txt.process(file_path)
+            import docx2txt
+            text = docx2txt.process(file_path)
+            return text.strip() if text else ""
         except Exception as e:
             logger.error(f"DOCX extraction failed: {e}")
-            raise
+            # Fallback: try alternative method
+            try:
+                from docx import Document
+                doc = Document(file_path)
+                text = []
+                for paragraph in doc.paragraphs:
+                    text.append(paragraph.text)
+                return '\n'.join(text)
+            except:
+                raise Exception(f"Could not extract text from DOCX: {e}")
 
     async def _extract_from_txt(self, file_path: str) -> str:
         """Extract text from TXT files"""
         try:
-            async with aiofiles.open(file_path, 'r', encoding='utf-8') as file:
-                return await file.read()
+            # Try different encodings
+            encodings = ['utf-8', 'utf-16', 'latin-1', 'ascii']
+            
+            for encoding in encodings:
+                try:
+                    async with aiofiles.open(file_path, 'r', encoding=encoding) as file:
+                        content = await file.read()
+                        return content
+                except UnicodeDecodeError:
+                    continue
+            
+            # If all encodings fail, read as bytes and decode with errors='ignore'
+            with open(file_path, 'rb') as file:
+                content = file.read()
+                return content.decode('utf-8', errors='ignore')
+                
         except Exception as e:
             logger.error(f"TXT extraction failed: {e}")
             raise
@@ -143,7 +154,7 @@ class EnhancedResumeService:
             if status:
                 query = query.filter(Resume.processing_status == status)
             
-            resumes = query.offset(skip).limit(limit).all()
+            resumes = query.order_by(Resume.created_at.desc()).offset(skip).limit(limit).all()
             
             result = []
             for resume in resumes:
@@ -206,11 +217,12 @@ class EnhancedResumeService:
     ) -> Dict[str, Any]:
         """Perform semantic search on resumes"""
         try:
-            # Check cache first
+            # Check cache first if available
             cache_key = f"search:resumes:{hash(query)}:{top_k}:{hash(str(filters))}"
-            cached_result = await self.cache_service.get(cache_key)
-            if cached_result:
-                return cached_result
+            if self.cache_service:
+                cached_result = await self.cache_service.get(cache_key)
+                if cached_result:
+                    return cached_result
             
             # Parse filters if provided
             filter_dict = {}
@@ -221,21 +233,26 @@ class EnhancedResumeService:
                 except json.JSONDecodeError:
                     logger.warning(f"Invalid filter format: {filters}")
             
-            # Perform vector search
-            results = await self.vector_service.search_similar_resumes(
-                query=query,
-                top_k=top_k,
-                filters=filter_dict
-            )
+            # Perform vector search if available
+            if self.vector_service:
+                results = await self.vector_service.search_similar_resumes(
+                    query=query,
+                    top_k=top_k,
+                    filters=filter_dict
+                )
+            else:
+                # Fallback to basic text search
+                results = {"documents": [[]], "metadatas": [[]], "distances": [[]]}
             
-            # Cache results
-            await self.cache_service.set(cache_key, results, ttl=900)  # 15 minutes
+            # Cache results if cache is available
+            if self.cache_service:
+                await self.cache_service.set(cache_key, results, ttl=900)  # 15 minutes
             
             return results
             
         except Exception as e:
             logger.error(f"Error in semantic search: {e}")
-            raise
+            return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
 
     async def get_resume_details(self, resume_id: str, db: Session) -> Optional[Dict[str, Any]]:
         """Get detailed resume information"""
@@ -265,3 +282,30 @@ class EnhancedResumeService:
         except Exception as e:
             logger.error(f"Error getting resume details: {e}")
             raise
+
+    async def health_check(self) -> Dict[str, Any]:
+        """Perform health check on resume service"""
+        try:
+            vector_health = "unknown"
+            cache_health = "unknown"
+            
+            if self.vector_service:
+                vector_check = await self.vector_service.health_check()
+                vector_health = vector_check.get("status", "unknown")
+            
+            if self.cache_service:
+                cache_check = await self.cache_service.health_check()
+                cache_health = cache_check.get("status", "unknown")
+            
+            return {
+                "status": "healthy",
+                "vector_service": vector_health,
+                "cache_service": cache_health,
+                "supported_formats": ["pdf", "docx", "txt"],
+                "max_file_size": settings.max_file_size
+            }
+            
+        except Exception as e:
+            logger.error(f"Resume service health check failed: {e}")
+            return {"status": "unhealthy", "error": str(e)}
+

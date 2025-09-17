@@ -1,4 +1,3 @@
-# backend/app/services/enhanced_job_service.py
 import logging
 from typing import List, Optional, Dict, Any
 import uuid
@@ -26,7 +25,7 @@ class EnhancedJobService:
             logger.info("Enhanced job service initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize enhanced job service: {e}")
-            raise
+            # Don't raise - allow partial functionality
 
     async def create_job_enhanced(self, job_data: Dict[str, Any], db: Session) -> str:
         """Create job with enhanced processing"""
@@ -93,8 +92,9 @@ class EnhancedJobService:
                     "department": job.department
                 }
                 
-                # Store embeddings
-                await self.vector_service.store_job_embeddings(job_id, job_data)
+                # Store embeddings if service is available
+                if self.vector_service:
+                    await self.vector_service.store_job_embeddings(job_id, job_data)
                 
                 # Update status
                 job.embedding_status = "completed"
@@ -159,7 +159,7 @@ class EnhancedJobService:
             if company:
                 query = query.filter(Job.company.ilike(f"%{company}%"))
             
-            jobs = query.offset(skip).limit(limit).all()
+            jobs = query.order_by(Job.created_at.desc()).offset(skip).limit(limit).all()
             
             result = []
             for job in jobs:
@@ -221,18 +221,48 @@ class EnhancedJobService:
         try:
             # Check cache first
             cache_key = f"search:jobs:{hash(query)}:{top_k}"
-            cached_result = await self.cache_service.get(cache_key)
-            if cached_result:
-                return cached_result
+            if self.cache_service:
+                cached_result = await self.cache_service.get(cache_key)
+                if cached_result:
+                    return cached_result
             
-            # Perform vector search (implement in vector service)
-            results = await self.vector_service.search_similar_jobs(query, top_k)
+            # Perform vector search if available
+            if self.vector_service:
+                results = await self.vector_service.search_similar_jobs(query, top_k)
+            else:
+                results = {"documents": [[]], "metadatas": [[]], "distances": [[]]}
             
             # Cache results
-            await self.cache_service.set(cache_key, results, ttl=900)  # 15 minutes
+            if self.cache_service:
+                await self.cache_service.set(cache_key, results, ttl=900)  # 15 minutes
             
             return results
             
         except Exception as e:
             logger.error(f"Error in job semantic search: {e}")
-            raise
+            return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+    async def health_check(self) -> Dict[str, Any]:
+        """Perform health check on job service"""
+        try:
+            vector_health = "unknown"
+            cache_health = "unknown"
+            
+            if self.vector_service:
+                vector_check = await self.vector_service.health_check()
+                vector_health = vector_check.get("status", "unknown")
+            
+            if self.cache_service:
+                cache_check = await self.cache_service.health_check()
+                cache_health = cache_check.get("status", "unknown")
+            
+            return {
+                "status": "healthy",
+                "vector_service": vector_health,
+                "cache_service": cache_health,
+                "features": ["job_creation", "embedding_processing", "semantic_search"]
+            }
+            
+        except Exception as e:
+            logger.error(f"Job service health check failed: {e}")
+            return {"status": "unhealthy", "error": str(e)}

@@ -1,4 +1,3 @@
-# backend/app/services/cache_service.py
 import aioredis
 import json
 import logging
@@ -67,38 +66,6 @@ class CacheService:
             logger.error(f"Cache delete error: {e}")
             return False
 
-    async def invalidate_pattern(self, pattern: str):
-        """Invalidate keys matching pattern"""
-        if not self.redis_client:
-            return False
-        
-        try:
-            keys = await self.redis_client.keys(pattern)
-            if keys:
-                await self.redis_client.delete(*keys)
-            return True
-        except Exception as e:
-            logger.error(f"Cache pattern invalidation error: {e}")
-            return False
-
-    async def get_stats(self) -> Dict[str, Any]:
-        """Get Redis statistics"""
-        if not self.redis_client:
-            return {"status": "unavailable"}
-        
-        try:
-            info = await self.redis_client.info()
-            return {
-                "status": "connected",
-                "used_memory": info.get("used_memory_human", "unknown"),
-                "connected_clients": info.get("connected_clients", 0),
-                "keyspace_hits": info.get("keyspace_hits", 0),
-                "keyspace_misses": info.get("keyspace_misses", 0)
-            }
-        except Exception as e:
-            logger.error(f"Error getting cache stats: {e}")
-            return {"status": "error", "error": str(e)}
-
     async def health_check(self) -> Dict[str, Any]:
         """Perform health check on cache service"""
         if not self.redis_client:
@@ -120,3 +87,4 @@ class CacheService:
         except Exception as e:
             logger.error(f"Cache health check failed: {e}")
             return {"status": "unhealthy", "error": str(e)}
+

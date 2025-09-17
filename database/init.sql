@@ -1,4 +1,4 @@
-# database/init.sql (Enhanced)
+
 -- Create database and user
 CREATE DATABASE resume_screening;
 CREATE USER app_user WITH ENCRYPTED PASSWORD 'secure_password';

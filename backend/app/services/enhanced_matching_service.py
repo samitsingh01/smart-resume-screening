@@ -1,10 +1,8 @@
-# backend/app/services/enhanced_matching_service.py
 import logging
 from typing import List, Dict, Any, Optional
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from app.services.aws_bedrock import BedrockLLM
-from langchain.prompts import PromptTemplate
+import re
 
 from app.services.vector_service import VectorService
 from app.services.cache_service import CacheService
@@ -18,11 +16,6 @@ class EnhancedMatchingService:
     def __init__(self):
         self.vector_service = VectorService()
         self.cache_service = CacheService()
-        self.llm = BedrockLLM(
-            model_id="anthropic.claude-3-sonnet-20240229-v1:0",
-            region_name=settings.aws_region,
-            model_kwargs={"max_tokens": 2000, "temperature": 0.1}
-        )
 
     async def initialize(self):
         """Initialize matching service"""
@@ -32,17 +25,18 @@ class EnhancedMatchingService:
             logger.info("Enhanced matching service initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize enhanced matching service: {e}")
-            raise
+            # Don't raise - allow partial functionality
 
     async def find_advanced_matches(self, job_id: str, top_k: int = 20, filters: Optional[Dict] = None) -> List[Dict[str, Any]]:
-        """Find matches using advanced algorithms"""
+        """Find matches using enhanced algorithms"""
         try:
             # Check cache first
             cache_key = f"matches:{job_id}:{top_k}:{hash(str(filters))}"
-            cached_result = await self.cache_service.get(cache_key)
-            if cached_result:
-                logger.info(f"Returning cached matches for job {job_id}")
-                return cached_result
+            if self.cache_service:
+                cached_result = await self.cache_service.get(cache_key)
+                if cached_result:
+                    logger.info(f"Returning cached matches for job {job_id}")
+                    return cached_result
 
             # Get job details
             db = next(get_db())
@@ -50,23 +44,31 @@ class EnhancedMatchingService:
             if not job:
                 raise ValueError(f"Job {job_id} not found")
 
-            # Create comprehensive search query
+            # Create comprehensive search queries
             search_queries = [
-                f"{job.title} {' '.join(job.required_skills)}",
-                f"{job.experience_level} {' '.join(job.requirements)}",
+                f"{job.title} {' '.join(job.required_skills or [])}",
+                f"{job.experience_level} {' '.join(job.requirements or [])}",
                 f"{job.department} {job.company}" if job.department else f"{job.company}"
             ]
 
             all_matches = {}
             
-            # Search with multiple query strategies
-            for i, query in enumerate(search_queries):
-                results = await self.vector_service.search_similar_resumes(
-                    query, top_k * 3, filters
-                )
-                
-                # Process results and calculate weighted scores
-                await self._process_search_results(results, all_matches, weight=1.0 - (i * 0.2))
+            # Search with multiple query strategies if vector service is available
+            if self.vector_service:
+                for i, query in enumerate(search_queries):
+                    try:
+                        results = await self.vector_service.search_similar_resumes(
+                            query, top_k * 2, filters
+                        )
+                        
+                        # Process results and calculate weighted scores
+                        await self._process_search_results(results, all_matches, weight=1.0 - (i * 0.2))
+                    except Exception as e:
+                        logger.warning(f"Search query {i} failed: {e}")
+                        
+            # Fallback to database matching if no vector results
+            if not all_matches:
+                all_matches = await self._fallback_database_matching(job, top_k, filters, db)
 
             # Calculate final scores and rankings
             final_matches = await self._calculate_final_scores(job, all_matches, top_k)
@@ -74,12 +76,13 @@ class EnhancedMatchingService:
             # Generate detailed explanations
             enhanced_matches = []
             for match in final_matches:
-                explanation = await self._generate_detailed_explanation(job, match)
+                explanation = self._generate_simple_explanation(job, match)
                 match["detailed_explanation"] = explanation
                 enhanced_matches.append(match)
 
             # Cache results
-            await self.cache_service.set(cache_key, enhanced_matches, ttl=1800)  # 30 minutes
+            if self.cache_service:
+                await self.cache_service.set(cache_key, enhanced_matches, ttl=1800)  # 30 minutes
             
             # Save matches to database
             await self._save_matches_to_db(job_id, enhanced_matches)
@@ -92,90 +95,151 @@ class EnhancedMatchingService:
         finally:
             db.close()
 
-    async def _process_search_results(self, results: Dict[str, Any], all_matches: Dict, weight: float = 1.0):
-        """Process search results and accumulate match scores"""
-        if not results.get("documents") or not results["documents"][0]:
-            return
-
-        for doc, metadata, distance in zip(
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0]
-        ):
-            resume_id = metadata["resume_id"]
-            similarity_score = (1 - distance) * weight
+    async def _fallback_database_matching(self, job: Job, top_k: int, filters: Optional[Dict], db) -> Dict[str, Any]:
+        """Fallback database-based matching when vector search is not available"""
+        try:
+            query = db.query(Resume).filter(Resume.processing_status == "completed")
             
-            if resume_id not in all_matches:
-                all_matches[resume_id] = {
-                    "resume_id": resume_id,
-                    "filename": metadata["filename"],
-                    "scores": [],
-                    "relevant_chunks": [],
-                    "metadata": metadata
+            # Apply filters
+            if filters:
+                if filters.get("experience_level"):
+                    query = query.filter(Resume.experience_level == filters["experience_level"])
+            
+            resumes = query.limit(top_k * 2).all()  # Get more candidates for better selection
+            
+            matches = {}
+            job_skills = set(skill.lower().strip() for skill in job.required_skills or [])
+            
+            for resume in resumes:
+                resume_skills = set(skill.lower().strip() for skill in resume.extracted_skills or [])
+                
+                # Calculate skill overlap
+                matched_skills = job_skills.intersection(resume_skills)
+                skill_score = len(matched_skills) / len(job_skills) if job_skills else 0.5
+                
+                # Calculate experience match
+                exp_score = self._calculate_experience_match_simple(
+                    job.experience_level, resume.experience_level, resume.experience_years
+                )
+                
+                # Combined score
+                combined_score = (skill_score * 0.7) + (exp_score * 0.3)
+                
+                matches[str(resume.id)] = {
+                    "resume_id": str(resume.id),
+                    "filename": resume.filename,
+                    "scores": [combined_score],
+                    "relevant_chunks": [resume.processed_content or resume.original_content or ""],
+                    "metadata": {
+                        "resume_id": str(resume.id),
+                        "filename": resume.filename,
+                        "experience_level": resume.experience_level,
+                        "skills": resume.extracted_skills or []
+                    }
                 }
             
-            all_matches[resume_id]["scores"].append(similarity_score)
-            all_matches[resume_id]["relevant_chunks"].append(doc)
+            return matches
+            
+        except Exception as e:
+            logger.error(f"Fallback matching failed: {e}")
+            return {}
+
+    async def _process_search_results(self, results: Dict[str, Any], all_matches: Dict, weight: float = 1.0):
+        """Process search results and accumulate match scores"""
+        try:
+            if not results.get("documents") or not results["documents"][0]:
+                return
+
+            for doc, metadata, distance in zip(
+                results["documents"][0],
+                results["metadatas"][0],
+                results["distances"][0]
+            ):
+                resume_id = metadata.get("resume_id")
+                if resume_id:
+                    similarity_score = max(0, (1 - distance)) * weight
+                    
+                    if resume_id not in all_matches:
+                        all_matches[resume_id] = {
+                            "resume_id": resume_id,
+                            "filename": metadata.get("filename", "Unknown"),
+                            "scores": [],
+                            "relevant_chunks": [],
+                            "metadata": metadata
+                        }
+                    
+                    all_matches[resume_id]["scores"].append(similarity_score)
+                    all_matches[resume_id]["relevant_chunks"].append(doc)
+                    
+        except Exception as e:
+            logger.error(f"Error processing search results: {e}")
 
     async def _calculate_final_scores(self, job: Job, all_matches: Dict, top_k: int) -> List[Dict[str, Any]]:
         """Calculate comprehensive final scores"""
-        final_matches = []
-        
-        for resume_data in all_matches.values():
-            scores = np.array(resume_data["scores"])
+        try:
+            final_matches = []
             
-            # Multi-factor scoring
-            base_score = np.mean(scores)
-            max_score = np.max(scores)
-            consistency_score = 1 - (np.std(scores) / (np.mean(scores) + 1e-8))
-            
-            # Weighted final score
-            final_score = (
-                base_score * 0.4 +
-                max_score * 0.3 +
-                consistency_score * 0.3
-            )
-            
-            # Skill matching analysis
-            skill_match_score = await self._calculate_skill_match(
-                job.required_skills,
-                resume_data["relevant_chunks"]
-            )
-            
-            # Experience level matching
-            experience_match_score = await self._calculate_experience_match(
-                job.experience_level,
-                resume_data["relevant_chunks"]
-            )
-            
-            # Combined final score
-            combined_score = (
-                final_score * 0.5 +
-                skill_match_score * 0.3 +
-                experience_match_score * 0.2
-            )
-            
-            final_matches.append({
-                "resume_id": resume_data["resume_id"],
-                "filename": resume_data["filename"],
-                "overall_score": round(combined_score * 100, 2),
-                "skill_match_score": round(skill_match_score * 100, 2),
-                "experience_match_score": round(experience_match_score * 100, 2),
-                "matched_skills": await self._extract_matched_skills(
-                    job.required_skills,
+            for resume_data in all_matches.values():
+                if not resume_data.get("scores"):
+                    continue
+                    
+                scores = np.array(resume_data["scores"])
+                
+                # Multi-factor scoring
+                base_score = np.mean(scores)
+                max_score = np.max(scores)
+                consistency_score = 1 - (np.std(scores) / (np.mean(scores) + 1e-8))
+                
+                # Weighted final score
+                final_score = (
+                    base_score * 0.4 +
+                    max_score * 0.3 +
+                    consistency_score * 0.3
+                )
+                
+                # Skill matching analysis
+                skill_match_score = await self._calculate_skill_match(
+                    job.required_skills or [],
                     resume_data["relevant_chunks"]
-                ),
-                "missing_skills": await self._extract_missing_skills(
-                    job.required_skills,
+                )
+                
+                # Experience level matching
+                experience_match_score = self._calculate_experience_match_from_metadata(
+                    job.experience_level,
+                    resume_data.get("metadata", {})
+                )
+                
+                # Combined final score
+                combined_score = (
+                    final_score * 0.4 +
+                    skill_match_score * 0.35 +
+                    experience_match_score * 0.25
+                )
+                
+                matched_skills, missing_skills = self._extract_skill_matches(
+                    job.required_skills or [],
                     resume_data["relevant_chunks"]
-                ),
-                "confidence_level": self._determine_confidence_level(combined_score),
-                "recommendation": self._determine_recommendation(combined_score)
-            })
-        
-        # Sort by score and return top_k
-        final_matches.sort(key=lambda x: x["overall_score"], reverse=True)
-        return final_matches[:top_k]
+                )
+                
+                final_matches.append({
+                    "resume_id": resume_data["resume_id"],
+                    "filename": resume_data["filename"],
+                    "overall_score": round(combined_score * 100, 2),
+                    "skill_match_score": round(skill_match_score * 100, 2),
+                    "experience_match_score": round(experience_match_score * 100, 2),
+                    "matched_skills": matched_skills,
+                    "missing_skills": missing_skills,
+                    "confidence_level": self._determine_confidence_level(combined_score),
+                    "recommendation": self._determine_recommendation(combined_score)
+                })
+            
+            # Sort by score and return top_k
+            final_matches.sort(key=lambda x: x["overall_score"], reverse=True)
+            return final_matches[:top_k]
+            
+        except Exception as e:
+            logger.error(f"Error calculating final scores: {e}")
+            return []
 
     async def _calculate_skill_match(self, required_skills: List[str], resume_chunks: List[str]) -> float:
         """Calculate skill matching score"""
@@ -186,54 +250,66 @@ class EnhancedMatchingService:
         matched_count = 0
         
         for skill in required_skills:
-            if skill.lower() in resume_text:
+            skill_variations = [
+                skill.lower(),
+                skill.lower().replace('.', ''),
+                skill.lower().replace(' ', ''),
+                skill.lower().replace('-', ' ')
+            ]
+            
+            if any(variation in resume_text for variation in skill_variations):
                 matched_count += 1
         
         return matched_count / len(required_skills)
 
-    async def _calculate_experience_match(self, required_level: str, resume_chunks: List[str]) -> float:
-        """Calculate experience level matching score"""
-        experience_keywords = {
-            "entry": ["junior", "entry", "associate", "trainee", "intern", "graduate", "fresher"],
-            "mid": ["mid", "intermediate", "experienced", "specialist", "developer", "analyst"],
-            "senior": ["senior", "lead", "principal", "expert", "architect", "manager", "director"],
-            "lead": ["lead", "principal", "director", "manager", "head", "chief", "vp", "vice president"]
-        }
+    def _calculate_experience_match_simple(self, required_level: str, resume_level: Optional[str], resume_years: Optional[int]) -> float:
+        """Simple experience level matching"""
+        level_hierarchy = {"entry": 1, "mid": 2, "senior": 3, "lead": 4}
         
-        resume_text = " ".join(resume_chunks).lower()
-        required_keywords = experience_keywords.get(required_level.lower(), [])
+        req_level_num = level_hierarchy.get(required_level.lower(), 2)
+        res_level_num = level_hierarchy.get((resume_level or "entry").lower(), 1)
         
-        if not required_keywords:
-            return 0.5  # Neutral score if level not recognized
+        # Consider years of experience
+        years_score = 0.5
+        if resume_years:
+            if resume_years >= 7:
+                years_score = 1.0
+            elif resume_years >= 3:
+                years_score = 0.8
+            elif resume_years >= 1:
+                years_score = 0.6
         
-        match_count = sum(1 for keyword in required_keywords if keyword in resume_text)
-        return min(match_count / len(required_keywords), 1.0)
+        # Combine level and years
+        level_diff = abs(req_level_num - res_level_num)
+        level_score = max(0, 1 - (level_diff * 0.3))
+        
+        return (level_score * 0.6) + (years_score * 0.4)
 
-    async def _extract_matched_skills(self, required_skills: List[str], resume_chunks: List[str]) -> List[str]:
-        """Extract skills that are present in both job and resume"""
+    def _calculate_experience_match_from_metadata(self, required_level: str, metadata: Dict) -> float:
+        """Calculate experience match from metadata"""
+        resume_level = metadata.get("experience_level")
+        resume_years = metadata.get("experience_years", 0)
+        
+        return self._calculate_experience_match_simple(required_level, resume_level, resume_years)
+
+    def _extract_skill_matches(self, required_skills: List[str], resume_chunks: List[str]) -> tuple:
+        """Extract matched and missing skills"""
         resume_text = " ".join(resume_chunks).lower()
         matched = []
         
         for skill in required_skills:
-            # Check for exact match or partial match
-            skill_lower = skill.lower()
-            if skill_lower in resume_text:
-                matched.append(skill)
-            # Check for common variations
-            elif any(variation in resume_text for variation in [
-                skill_lower.replace('.', ''),
-                skill_lower.replace(' ', ''),
-                skill_lower.replace('-', ' '),
-                skill_lower.replace('_', ' ')
-            ]):
+            skill_variations = [
+                skill.lower(),
+                skill.lower().replace('.', ''),
+                skill.lower().replace(' ', ''),
+                skill.lower().replace('-', ' ')
+            ]
+            
+            if any(variation in resume_text for variation in skill_variations):
                 matched.append(skill)
         
-        return matched
-
-    async def _extract_missing_skills(self, required_skills: List[str], resume_chunks: List[str]) -> List[str]:
-        """Extract skills that are missing from resume"""
-        matched_skills = await self._extract_matched_skills(required_skills, resume_chunks)
-        return [skill for skill in required_skills if skill not in matched_skills]
+        missing = [skill for skill in required_skills if skill not in matched]
+        return matched, missing
 
     def _determine_confidence_level(self, score: float) -> str:
         """Determine confidence level based on score"""
@@ -250,59 +326,59 @@ class EnhancedMatchingService:
             return "strongly_recommended"
         elif score >= 0.65:
             return "recommended"
-        elif score >= 0.5:
+        elif score >= 0.4:
             return "consider"
         else:
             return "not_recommended"
 
-    async def _generate_detailed_explanation(self, job: Job, match: Dict[str, Any]) -> str:
-        """Generate detailed explanation using advanced LLM"""
-        prompt = PromptTemplate(
-            input_variables=["job_title", "job_requirements", "job_skills", "overall_score", "skill_match_score", "experience_match_score", "matched_skills", "missing_skills"],
-            template="""
-            As an expert HR analyst, provide a detailed assessment of this candidate match:
-            
-            Job Position: {job_title}
-            Requirements: {job_requirements}
-            Required Skills: {job_skills}
-            
-            Candidate Assessment:
-            - Overall Match Score: {overall_score}%
-            - Skill Match Score: {skill_match_score}%
-            - Experience Match Score: {experience_match_score}%
-            - Matched Skills: {matched_skills}
-            - Missing Skills: {missing_skills}
-            
-            Provide a comprehensive 3-4 sentence analysis covering:
-            1. Key strengths of this candidate for this role
-            2. Areas where they excel and align with requirements
-            3. Potential concerns or skill gaps to consider
-            4. Overall hiring recommendation with rationale
-            
-            Be specific, actionable, and professional in your assessment.
-            """
-        )
-        
+    def _generate_simple_explanation(self, job: Job, match: Dict[str, Any]) -> str:
+        """Generate simple explanation without LLM"""
         try:
-            formatted_prompt = prompt.format(
-                job_title=job.title,
-                job_requirements=", ".join(job.requirements) if job.requirements else "None specified",
-                job_skills=", ".join(job.required_skills) if job.required_skills else "None specified",
-                overall_score=match["overall_score"],
-                skill_match_score=match["skill_match_score"],
-                experience_match_score=match["experience_match_score"],
-                matched_skills=", ".join(match["matched_skills"]) if match["matched_skills"] else "None",
-                missing_skills=", ".join(match["missing_skills"]) if match["missing_skills"] else "None"
-            )
+            matched_skills = match.get("matched_skills", [])
+            missing_skills = match.get("missing_skills", [])
+            overall_score = match.get("overall_score", 0)
             
-            explanation = await self.llm.ainvoke(formatted_prompt)
-            return explanation.strip()
+            explanation_parts = []
+            
+            # Overall assessment
+            if overall_score >= 80:
+                explanation_parts.append("Excellent candidate match.")
+            elif overall_score >= 65:
+                explanation_parts.append("Strong candidate with good alignment.")
+            elif overall_score >= 50:
+                explanation_parts.append("Decent candidate worth considering.")
+            else:
+                explanation_parts.append("Limited match with requirements.")
+            
+            # Skills assessment
+            if matched_skills:
+                if len(matched_skills) > 5:
+                    explanation_parts.append(f"Has strong technical skills including {', '.join(matched_skills[:3])} and {len(matched_skills)-3} others.")
+                else:
+                    explanation_parts.append(f"Possesses key skills: {', '.join(matched_skills)}.")
+            
+            # Gaps
+            if missing_skills and len(missing_skills) <= 3:
+                explanation_parts.append(f"May need development in: {', '.join(missing_skills)}.")
+            elif missing_skills:
+                explanation_parts.append(f"Some skill gaps identified in {len(missing_skills)} areas.")
+            
+            # Recommendation
+            recommendation = match.get("recommendation", "").replace("_", " ")
+            if recommendation == "strongly recommended":
+                explanation_parts.append("Highly recommended for immediate consideration.")
+            elif recommendation == "recommended":
+                explanation_parts.append("Recommended for interview process.")
+            elif recommendation == "consider":
+                explanation_parts.append("Worth considering with some reservations.")
+            else:
+                explanation_parts.append("May not be the best fit for this role.")
+            
+            return " ".join(explanation_parts)
             
         except Exception as e:
-            logger.error(f"Error generating detailed explanation: {e}")
-            # Fallback explanation
-            matched_skills_str = ", ".join(match["matched_skills"][:3]) if match["matched_skills"] else "some relevant skills"
-            return f"Strong candidate with {match['overall_score']}% overall match. Key strengths include {matched_skills_str}. Skill alignment at {match['skill_match_score']}% with experience level matching at {match['experience_match_score']}%. Recommend for {match['recommendation'].replace('_', ' ')} consideration."
+            logger.error(f"Error generating explanation: {e}")
+            return f"Candidate scored {match.get('overall_score', 0)}% match with {len(match.get('matched_skills', []))} matching skills."
 
     async def _save_matches_to_db(self, job_id: str, matches: List[Dict[str, Any]]):
         """Save match results to database"""
@@ -380,23 +456,25 @@ class EnhancedMatchingService:
     async def health_check(self) -> Dict[str, Any]:
         """Perform health check on matching service"""
         try:
-            # Test LLM connection
-            test_response = await self.llm.ainvoke("Say 'test' in one word.")
+            vector_health = "unknown"
+            cache_health = "unknown"
             
-            # Test vector service
-            vector_health = await self.vector_service.health_check()
+            if self.vector_service:
+                vector_check = await self.vector_service.health_check()
+                vector_health = vector_check.get("status", "unknown")
+            
+            if self.cache_service:
+                cache_check = await self.cache_service.health_check()
+                cache_health = cache_check.get("status", "unknown")
             
             return {
                 "status": "healthy",
-                "llm_model": self.llm.model_id,
-                "test_response": test_response[:20] if test_response else "No response",
-                "vector_service": vector_health.get("status", "unknown"),
-                "cache_service": "healthy" if self.cache_service.redis_client else "unavailable"
+                "vector_service": vector_health,
+                "cache_service": cache_health,
+                "matching_algorithms": ["skill_matching", "experience_matching", "semantic_similarity"],
+                "fallback_available": True
             }
             
         except Exception as e:
             logger.error(f"Matching service health check failed: {e}")
-            return {
-                "status": "unhealthy",
-                "error": str(e)
-            }
+            return {"status": "unhealthy", "error": str(e)}

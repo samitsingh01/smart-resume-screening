@@ -1,16 +1,12 @@
-# backend/requirements.txt - MINIMAL WORKING VERSION
+# backend/requirements.txt - CLEAN VERSION WITHOUT CONFLICTS
 # Core FastAPI stack
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-
-# AWS SDK (direct boto3 - no langchain-aws conflicts)
-boto3==1.34.144
-botocore==1.34.144
+python-multipart==0.0.6
 
 # Database
 psycopg2-binary==2.9.9
 sqlalchemy==2.0.23
-alembic==1.13.0
 
 # Redis
 aioredis==2.0.1
@@ -18,14 +14,7 @@ aioredis==2.0.1
 # Vector database
 chromadb==0.4.24
 
-# Core LangChain (minimal - we'll build AWS integration manually)
-langchain==0.1.0
-langchain-core==0.1.7
-langchain-community==0.0.13
-langsmith==0.0.87
-
 # File processing
-python-multipart==0.0.6
 aiofiles==23.2.1
 PyPDF2==3.0.1
 docx2txt==0.8
@@ -43,19 +32,16 @@ pydantic-settings==2.1.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 
-# Monitoring
-prometheus-client==0.20.0
-structlog==23.2.0
-
-# Core dependencies
-typing-extensions==4.9.0
+# HTTP and utilities
 requests==2.32.3
-PyYAML==6.0.1
-tenacity==8.5.0
-jsonpatch==1.33
-
-# HTTP clients
 aiohttp==3.9.1
+tenacity==8.5.0
+PyYAML==6.0.1
 
-# Data processing
+# Data handling
+typing-extensions==4.9.0
 dataclasses-json==0.6.3
+
+# Core utilities
+setuptools==68.0.0
+wheel==0.41.0
