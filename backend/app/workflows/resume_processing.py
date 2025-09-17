@@ -2,10 +2,11 @@ import logging
 from typing import Dict, Any, List
 from datetime import datetime
 import traceback
+import re
 
 from app.services.nlp_service import NLPService
 from app.services.vector_service import VectorService
-from app.core.database import get_db
+from app.core.database import SessionLocal
 from app.models.database import Resume, ProcessingLog
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ class ResumeProcessingWorkflow:
             self.nlp_service = NLPService()
             self.vector_service = VectorService()
             await self.vector_service.initialize()
+            logger.info("Resume processing workflow initialized")
         except Exception as e:
             logger.warning(f"Workflow initialization partial failure: {e}")
 
@@ -36,7 +38,7 @@ class ResumeProcessingWorkflow:
             "processing_time": 0.0
         }
         
-        db = next(get_db())
+        db = SessionLocal()
         
         try:
             # Update status to processing
@@ -74,6 +76,7 @@ class ResumeProcessingWorkflow:
             quality_score = self._calculate_basic_quality(processed_content, skills, experience_data)
             
             # Step 5: Generate embeddings (if service available)
+            embedding_status = "pending"
             if self.vector_service:
                 try:
                     metadata = {
@@ -83,9 +86,11 @@ class ResumeProcessingWorkflow:
                         "experience_level": experience_data.get("level", ""),
                     }
                     await self.vector_service.store_resume_embeddings(resume_id, processed_content, metadata)
+                    embedding_status = "completed"
                 except Exception as e:
                     logger.warning(f"Vector embedding failed: {e}")
                     result["errors"].append(f"Embedding generation failed: {e}")
+                    embedding_status = "failed"
             
             # Step 6: Update database
             if resume:
@@ -95,7 +100,7 @@ class ResumeProcessingWorkflow:
                 resume.experience_years = experience_data.get("years", 0)
                 resume.quality_score = quality_score
                 resume.processing_status = "completed" if not result["errors"] else "partial"
-                resume.embedding_status = "completed" if self.vector_service else "failed"
+                resume.embedding_status = embedding_status
                 
                 db.commit()
             
@@ -157,11 +162,10 @@ class ResumeProcessingWorkflow:
 
     def _clean_content(self, content: str) -> str:
         """Basic content cleaning"""
-        import re
-        # Remove excessive whitespace
+        # Remove extra whitespace
         content = re.sub(r'\s+', ' ', content)
         # Remove special characters but keep important ones
-        content = re.sub(r'[^\w\s\-\.\@\(\)]', ' ', content)
+        content = re.sub(r'[^\w\s\-\.\@\(\)\+]', ' ', content)
         return content.strip()
 
     def _extract_skills_fallback(self, content: str) -> List[str]:
@@ -186,8 +190,6 @@ class ResumeProcessingWorkflow:
 
     def _extract_experience_fallback(self, content: str) -> Dict[str, Any]:
         """Fallback experience extraction using pattern matching"""
-        import re
-        
         content_lower = content.lower()
         
         # Try to find years of experience
@@ -201,7 +203,7 @@ class ResumeProcessingWorkflow:
         for pattern in year_patterns:
             matches = re.findall(pattern, content_lower)
             if matches:
-                years = max(int(match) for match in matches)
+                years = max(int(match) for match in matches if match.isdigit())
                 break
         
         # Determine level based on years and keywords

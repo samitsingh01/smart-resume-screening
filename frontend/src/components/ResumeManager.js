@@ -1,4 +1,3 @@
-// frontend/src/components/ResumeManager.js
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 
@@ -15,7 +14,7 @@ const ResumeManager = ({ apiUrl, setLoading, showNotification }) => {
     try {
       setLoading(true);
       const response = await axios.get(`${apiUrl}/api/v2/resumes`);
-      setResumes(response.data);
+      setResumes(response.data || []);
     } catch (error) {
       showNotification('Error loading resumes: ' + error.message, 'error');
     } finally {
@@ -24,14 +23,18 @@ const ResumeManager = ({ apiUrl, setLoading, showNotification }) => {
   };
 
   const handleFileUpload = async (files) => {
+    if (!files || files.length === 0) return;
+    
     const fileArray = Array.from(files);
     
     for (const file of fileArray) {
+      // Validate file format
       if (!file.name.toLowerCase().match(/\.(pdf|docx|txt)$/)) {
         showNotification(`Invalid file format: ${file.name}. Please use PDF, DOCX, or TXT.`, 'error');
         continue;
       }
       
+      // Validate file size (10MB)
       if (file.size > 10 * 1024 * 1024) {
         showNotification(`File too large: ${file.name}. Maximum size is 10MB.`, 'error');
         continue;
@@ -43,7 +46,7 @@ const ResumeManager = ({ apiUrl, setLoading, showNotification }) => {
       try {
         setUploadProgress(prev => ({ ...prev, [file.name]: 0 }));
         
-        await axios.post(`${apiUrl}/api/v2/resumes/upload`, formData, {
+        const response = await axios.post(`${apiUrl}/api/v2/resumes/upload`, formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
           onUploadProgress: (progressEvent) => {
             const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
@@ -51,7 +54,11 @@ const ResumeManager = ({ apiUrl, setLoading, showNotification }) => {
           }
         });
         
-        showNotification(`Resume "${file.name}" uploaded successfully!`, 'success');
+        if (response.data) {
+          showNotification(`Resume "${file.name}" uploaded successfully!`, 'success');
+        }
+        
+        // Remove from progress
         setUploadProgress(prev => {
           const newProgress = { ...prev };
           delete newProgress[file.name];
@@ -59,7 +66,10 @@ const ResumeManager = ({ apiUrl, setLoading, showNotification }) => {
         });
         
       } catch (error) {
-        showNotification(`Error uploading ${file.name}: ${error.message}`, 'error');
+        const errorMsg = error.response?.data?.detail || error.message;
+        showNotification(`Error uploading ${file.name}: ${errorMsg}`, 'error');
+        
+        // Remove from progress
         setUploadProgress(prev => {
           const newProgress = { ...prev };
           delete newProgress[file.name];
@@ -68,7 +78,10 @@ const ResumeManager = ({ apiUrl, setLoading, showNotification }) => {
       }
     }
     
-    loadResumes();
+    // Refresh resume list after upload
+    setTimeout(() => {
+      loadResumes();
+    }, 2000);
   };
 
   const handleDrag = (e) => {
@@ -100,6 +113,13 @@ const ResumeManager = ({ apiUrl, setLoading, showNotification }) => {
     }
   };
 
+  const getQualityColor = (score) => {
+    if (!score) return '#6c757d';
+    if (score > 0.7) return '#28a745';
+    if (score > 0.4) return '#ffc107';
+    return '#dc3545';
+  };
+
   return (
     <div className="resume-manager">
       <div className="manager-header">
@@ -108,6 +128,9 @@ const ResumeManager = ({ apiUrl, setLoading, showNotification }) => {
           <span className="stat">Total Resumes: {resumes.length}</span>
           <span className="stat">
             Processed: {resumes.filter(r => r.processing_status === 'completed').length}
+          </span>
+          <span className="stat">
+            Processing: {resumes.filter(r => r.processing_status === 'processing').length}
           </span>
         </div>
       </div>
@@ -141,9 +164,16 @@ const ResumeManager = ({ apiUrl, setLoading, showNotification }) => {
             </div>
             
             <div className="upload-info">
-              <p>Supported formats: PDF, DOCX, TXT</p>
-              <p>Maximum file size: 10MB</p>
-              <p>Multiple files supported</p>
+              <div className="info-item">
+                <strong>Supported formats:</strong>
+                <ul>
+                  <li>📄 PDF files (.pdf)</li>
+                  <li>📝 Word documents (.docx)</li>
+                  <li>📃 Text files (.txt)</li>
+                </ul>
+              </div>
+              <p><strong>Maximum file size:</strong> 10MB per file</p>
+              <p><strong>Multiple files:</strong> Supported</p>
             </div>
           </div>
 
@@ -152,14 +182,14 @@ const ResumeManager = ({ apiUrl, setLoading, showNotification }) => {
               <h4>Uploading Files...</h4>
               {Object.entries(uploadProgress).map(([filename, progress]) => (
                 <div key={filename} className="progress-item">
-                  <span>{filename}</span>
+                  <span className="filename">{filename}</span>
                   <div className="progress-bar">
                     <div 
                       className="progress-fill" 
                       style={{ width: `${progress}%` }}
                     />
                   </div>
-                  <span>{progress}%</span>
+                  <span className="progress-percent">{progress}%</span>
                 </div>
               ))}
             </div>
@@ -179,98 +209,106 @@ const ResumeManager = ({ apiUrl, setLoading, showNotification }) => {
             </div>
           </div>
           
-          <div className="resume-grid">
-            {resumes.map((resume) => (
-              <div key={resume.resume_id} className="resume-card">
-                <div className="card-header">
-                  <h4 title={resume.filename}>
-                    {resume.filename.length > 30 
-                      ? resume.filename.substring(0, 30) + '...' 
-                      : resume.filename}
-                  </h4>
-                  <div className="file-type-badge">
-                    {resume.file_type?.toUpperCase()}
-                  </div>
-                </div>
-                
-                <div className="card-content">
-                  <div className="status-row">
-                    <span>Processing:</span>
-                    <span 
-                      className="status-indicator"
-                      style={{ color: getStatusColor(resume.processing_status) }}
-                    >
-                      {resume.processing_status}
-                    </span>
-                  </div>
-                  
-                  <div className="status-row">
-                    <span>Embeddings:</span>
-                    <span 
-                      className="status-indicator"
-                      style={{ color: getStatusColor(resume.embedding_status) }}
-                    >
-                      {resume.embedding_status}
-                    </span>
-                  </div>
-                  
-                  {resume.quality_score && (
-                    <div className="quality-score">
-                      <span>Quality Score:</span>
-                      <div className="score-bar">
-                        <div 
-                          className="score-fill"
-                          style={{ 
-                            width: `${resume.quality_score * 100}%`,
-                            backgroundColor: resume.quality_score > 0.7 ? '#28a745' : 
-                                           resume.quality_score > 0.4 ? '#ffc107' : '#dc3545'
-                          }}
-                        />
-                        <span className="score-text">
-                          {Math.round(resume.quality_score * 100)}%
-                        </span>
-                      </div>
-                    </div>
-                  )}
-                  
-                  {resume.extracted_skills_count > 0 && (
-                    <div className="skills-info">
-                      <span>Skills Extracted: {resume.extracted_skills_count}</span>
-                    </div>
-                  )}
-                  
-                  {resume.experience_level && (
-                    <div className="experience-info">
-                      <span>Experience: {resume.experience_level}</span>
-                      {resume.experience_years && (
-                        <span> ({resume.experience_years} years)</span>
-                      )}
-                    </div>
-                  )}
-                </div>
-                
-                <div className="card-footer">
-                  <small>
-                    Uploaded: {new Date(resume.created_at).toLocaleDateString()}
-                  </small>
-                  <div className="card-actions">
-                    <button 
-                      className="btn-small"
-                      onClick={() => window.open(`/api/v2/resumes/${resume.resume_id}/status`, '_blank')}
-                    >
-                      Details
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-          
-          {resumes.length === 0 && (
+          {resumes.length === 0 ? (
             <div className="empty-state">
               <div className="empty-icon">📄</div>
               <h3>No resumes uploaded yet</h3>
               <p>Upload your first resume to get started with AI-powered matching!</p>
+            </div>
+          ) : (
+            <div className="resume-grid">
+              {resumes.map((resume) => (
+                <div key={resume.resume_id} className="resume-card">
+                  <div className="card-header">
+                    <h4 title={resume.filename}>
+                      {resume.filename.length > 25 
+                        ? resume.filename.substring(0, 25) + '...' 
+                        : resume.filename}
+                    </h4>
+                    <div className="file-type-badge">
+                      {resume.file_type?.toUpperCase()}
+                    </div>
+                  </div>
+                  
+                  <div className="card-content">
+                    <div className="status-row">
+                      <span>Processing:</span>
+                      <span 
+                        className="status-indicator"
+                        style={{ color: getStatusColor(resume.processing_status) }}
+                      >
+                        ●
+                      </span>
+                      <span className="status-text">{resume.processing_status}</span>
+                    </div>
+                    
+                    <div className="status-row">
+                      <span>Embeddings:</span>
+                      <span 
+                        className="status-indicator"
+                        style={{ color: getStatusColor(resume.embedding_status) }}
+                      >
+                        ●
+                      </span>
+                      <span className="status-text">{resume.embedding_status}</span>
+                    </div>
+                    
+                    {resume.quality_score && (
+                      <div className="quality-score">
+                        <span>Quality Score:</span>
+                        <div className="score-bar">
+                          <div 
+                            className="score-fill"
+                            style={{ 
+                              width: `${resume.quality_score * 100}%`,
+                              backgroundColor: getQualityColor(resume.quality_score)
+                            }}
+                          />
+                          <span className="score-text">
+                            {Math.round(resume.quality_score * 100)}%
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                    
+                    <div className="resume-meta">
+                      <div className="meta-item">
+                        <span>Size: {Math.round(resume.file_size / 1024)} KB</span>
+                      </div>
+                      
+                      {resume.extracted_skills_count > 0 && (
+                        <div className="meta-item">
+                          <span>Skills: {resume.extracted_skills_count}</span>
+                        </div>
+                      )}
+                      
+                      {resume.experience_level && (
+                        <div className="meta-item">
+                          <span>Level: {resume.experience_level}</span>
+                          {resume.experience_years && (
+                            <span> ({resume.experience_years}y)</span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  
+                  <div className="card-footer">
+                    <small>
+                      Uploaded: {new Date(resume.created_at).toLocaleDateString()}
+                    </small>
+                    <div className="card-actions">
+                      <button 
+                        className="btn-small"
+                        onClick={() => window.open(`${apiUrl}/api/v2/resumes/${resume.resume_id}/status`, '_blank')}
+                        title="View detailed status"
+                      >
+                        📊 Details
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </div>
@@ -279,38 +317,4 @@ const ResumeManager = ({ apiUrl, setLoading, showNotification }) => {
   );
 };
 
-export default ResumeManager;={showNotification}
-          />
-        )}
-        
-        {activeTab === 'resumes' && (
-          <ResumeManager 
-            apiUrl={API_BASE_URL}
-            setLoading={setLoading}
-            showNotification={showNotification}
-          />
-        )}
-        
-        {activeTab === 'matching' && (
-          <MatchingDashboard 
-            apiUrl={API_BASE_URL}
-            setLoading={setLoading}
-            showNotification={showNotification}
-          />
-        )}
-        
-        {activeTab === 'analytics' && (
-          <Analytics 
-            apiUrl={API_BASE_URL}
-            setLoading={setLoading}
-            showNotification={showNotification}
-          />
-        )}
-      </main>
-
-      {loading && <LoadingSpinner />}
-    </div>
-  );
-}
-
-export default App;
+export default ResumeManager;

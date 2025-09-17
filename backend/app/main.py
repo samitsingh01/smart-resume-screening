@@ -10,6 +10,7 @@ import tempfile
 import os
 from datetime import datetime, timedelta
 import traceback
+import uuid
 
 from app.models.database import Job, Resume, JobResumeMatch, ResumeAnalytics
 from app.models.schemas import (
@@ -66,30 +67,38 @@ async def startup_event():
         create_tables()
         logger.info("Database tables created/verified")
         
-        # Initialize services
-        resume_service = EnhancedResumeService()
-        job_service = EnhancedJobService()
-        matching_service = EnhancedMatchingService()
-        resume_workflow = ResumeProcessingWorkflow()
-        
-        # Initialize all services with error handling
+        # Initialize services with proper error handling
         try:
+            resume_service = EnhancedResumeService()
             await resume_service.initialize()
             logger.info("Resume service initialized")
         except Exception as e:
             logger.warning(f"Resume service initialization failed: {e}")
+            resume_service = None
         
         try:
+            job_service = EnhancedJobService()
             await job_service.initialize()
             logger.info("Job service initialized")
         except Exception as e:
             logger.warning(f"Job service initialization failed: {e}")
+            job_service = None
         
         try:
+            matching_service = EnhancedMatchingService()
             await matching_service.initialize()
             logger.info("Matching service initialized")
         except Exception as e:
             logger.warning(f"Matching service initialization failed: {e}")
+            matching_service = None
+        
+        try:
+            resume_workflow = ResumeProcessingWorkflow()
+            await resume_workflow.initialize()
+            logger.info("Resume workflow initialized")
+        except Exception as e:
+            logger.warning(f"Resume workflow initialization failed: {e}")
+            resume_workflow = None
         
         logger.info("Startup completed successfully")
         
@@ -144,19 +153,37 @@ async def create_job_v2(
 ):
     """Create a new job posting with enhanced processing"""
     try:
-        if not job_service:
-            raise HTTPException(status_code=503, detail="Job service not available")
-            
-        job_id = await job_service.create_job_enhanced(job.dict(), db)
-        
-        # Process job embeddings in background if service is available
         if job_service:
+            job_id = await job_service.create_job_enhanced(job.dict(), db)
+            # Process job embeddings in background
             background_tasks.add_task(job_service.process_job_embeddings, job_id)
+        else:
+            # Fallback direct database creation
+            job_id = str(uuid.uuid4())
+            new_job = Job(
+                id=job_id,
+                title=job.title,
+                company=job.company,
+                description=job.description,
+                requirements=job.requirements,
+                required_skills=job.required_skills,
+                experience_level=job.experience_level,
+                location=job.location,
+                salary_range=job.salary_range,
+                department=job.department,
+                job_type=job.job_type,
+                remote_allowed=job.remote_allowed,
+                priority=job.priority,
+                status="active",
+                embedding_status="pending"
+            )
+            db.add(new_job)
+            db.commit()
         
         return JobResponse(
             job_id=job_id,
             status="created",
-            message="Job created successfully and is being processed"
+            message="Job created successfully"
         )
         
     except Exception as e:
@@ -173,7 +200,12 @@ async def list_jobs_v2(
 ):
     """List jobs with pagination and filtering"""
     try:
-        if not job_service:
+        if job_service:
+            jobs = await job_service.list_jobs_enhanced(
+                db, skip=skip, limit=limit, status=status, company=company
+            )
+            return jobs
+        else:
             # Fallback to direct database query
             query = db.query(Job)
             if status:
@@ -201,11 +233,6 @@ async def list_jobs_v2(
                     "updated_at": job.updated_at.isoformat()
                 })
             return result
-        else:
-            jobs = await job_service.list_jobs_enhanced(
-                db, skip=skip, limit=limit, status=status, company=company
-            )
-            return jobs
     except Exception as e:
         logger.error(f"Error listing jobs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -271,32 +298,24 @@ async def upload_resume_v2(
                 text_content = await resume_service.extract_text_from_file(tmp_file_path, file.filename)
             else:
                 # Fallback text extraction
-                text_content = content.decode('utf-8', errors='ignore')[:5000]
+                if file.filename.lower().endswith('.txt'):
+                    text_content = content.decode('utf-8', errors='ignore')
+                else:
+                    text_content = content.decode('utf-8', errors='ignore')[:5000]
             
             # Create resume record
-            if resume_service:
-                resume_id = await resume_service.create_resume_record(
-                    filename=file.filename,
-                    raw_content=text_content,
-                    file_size=len(content),
-                    db=db
-                )
-            else:
-                # Direct database creation
-                from app.models.database import Resume
-                import uuid
-                resume_id = str(uuid.uuid4())
-                resume = Resume(
-                    id=resume_id,
-                    filename=file.filename,
-                    original_content=text_content,
-                    file_size=len(content),
-                    file_type=file.filename.split('.')[-1].lower(),
-                    processing_status="pending",
-                    embedding_status="pending"
-                )
-                db.add(resume)
-                db.commit()
+            resume_id = str(uuid.uuid4())
+            resume = Resume(
+                id=resume_id,
+                filename=file.filename,
+                original_content=text_content,
+                file_size=len(content),
+                file_type=file.filename.split('.')[-1].lower(),
+                processing_status="pending",
+                embedding_status="pending"
+            )
+            db.add(resume)
+            db.commit()
             
             # Process resume in background if workflow is available
             if resume_workflow and background_tasks:
@@ -309,12 +328,13 @@ async def upload_resume_v2(
                 resume_id=resume_id,
                 filename=file.filename,
                 status="uploaded",
-                message="Resume uploaded successfully and is being processed"
+                message="Resume uploaded successfully"
             )
             
         finally:
             # Clean up temp file
-            os.unlink(tmp_file_path)
+            if os.path.exists(tmp_file_path):
+                os.unlink(tmp_file_path)
             
     except HTTPException:
         raise
@@ -392,7 +412,7 @@ async def get_resume_processing_status(
         logger.error(f"Error getting processing status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Simple Matching Endpoint
+# Matching Endpoint
 @app.post("/api/v2/match/advanced", response_model=List[MatchResponse])
 async def find_advanced_matches(
     job_id: str = Query(...),
@@ -401,7 +421,7 @@ async def find_advanced_matches(
     experience_filter: Optional[str] = Query(None),
     db: Session = Depends(get_db)
 ):
-    """Find matches using basic algorithm with filtering"""
+    """Find matches using enhanced algorithms"""
     try:
         if matching_service:
             matches = await matching_service.find_advanced_matches(
@@ -487,13 +507,15 @@ async def get_analytics_overview(db: Session = Depends(get_db)):
         job_status_counts = {}
         
         try:
-            resume_statuses = db.query(Resume.processing_status, db.func.count(Resume.id)).group_by(Resume.processing_status).all()
+            from sqlalchemy import func
+            resume_statuses = db.query(Resume.processing_status, func.count(Resume.id)).group_by(Resume.processing_status).all()
             resume_status_counts = dict(resume_statuses)
         except:
             pass
             
         try:
-            job_statuses = db.query(Job.status, db.func.count(Job.id)).group_by(Job.status).all()
+            from sqlalchemy import func
+            job_statuses = db.query(Job.status, func.count(Job.id)).group_by(Job.status).all()
             job_status_counts = dict(job_statuses)
         except:
             pass
@@ -541,11 +563,10 @@ async def global_exception_handler(request, exc):
 
 if __name__ == "__main__":
     uvicorn.run(
-        "main:app",
+        "app.main:app",
         host="0.0.0.0",
         port=8000,
         reload=settings.debug,
         workers=1,
         log_level=settings.log_level.lower()
     )
-
