@@ -9,8 +9,8 @@ import asyncio
 from typing import List, Optional, Dict, Any
 import tempfile
 import os
-from datetime import datetime
-
+from datetime import datetime, timedelta
+from app.services.aws_bedrock import test_aws_connection
 from app.models.database import Job, Resume, JobResumeMatch, ResumeAnalytics
 from app.models.schemas import (
     JobCreateRequest, JobResponse, ResumeResponse, MatchResponse,
@@ -88,6 +88,28 @@ async def startup_event():
 async def shutdown_event():
     """Cleanup on shutdown"""
     logger.info("Shutting down Smart Resume Screening API...")
+
+@app.on_startup
+async def startup_event():
+    """Initialize services and database on startup"""
+    global resume_service, job_service, matching_service, resume_workflow
+    
+    logger.info("Starting Smart Resume Screening API v2.0...")
+    
+    try:
+        # Test AWS connection first
+        if not test_aws_connection():
+            logger.warning("AWS Bedrock connection test failed - check credentials")
+        else:
+            logger.info("AWS Bedrock connection successful")
+        
+        # Create database tables
+        create_tables()
+        
+        # ... rest of your startup code
+    except Exception as e:
+        logger.error(f"Startup failed: {e}")
+        raise
 
 # Health Check Endpoints
 @app.get("/health")

@@ -1,9 +1,9 @@
 # backend/app/services/enhanced_matching_service.py
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from langchain_aws import BedrockLLM
+from app.services.aws_bedrock import BedrockLLM
 from langchain.prompts import PromptTemplate
 
 from app.services.vector_service import VectorService
@@ -54,7 +54,7 @@ class EnhancedMatchingService:
             search_queries = [
                 f"{job.title} {' '.join(job.required_skills)}",
                 f"{job.experience_level} {' '.join(job.requirements)}",
-                f"{job.department} {job.company}"
+                f"{job.department} {job.company}" if job.department else f"{job.company}"
             ]
 
             all_matches = {}
@@ -194,10 +194,10 @@ class EnhancedMatchingService:
     async def _calculate_experience_match(self, required_level: str, resume_chunks: List[str]) -> float:
         """Calculate experience level matching score"""
         experience_keywords = {
-            "entry": ["junior", "entry", "associate", "trainee", "intern"],
-            "mid": ["mid", "intermediate", "experienced", "specialist"],
-            "senior": ["senior", "lead", "principal", "expert", "architect"],
-            "lead": ["lead", "principal", "director", "manager", "head"]
+            "entry": ["junior", "entry", "associate", "trainee", "intern", "graduate", "fresher"],
+            "mid": ["mid", "intermediate", "experienced", "specialist", "developer", "analyst"],
+            "senior": ["senior", "lead", "principal", "expert", "architect", "manager", "director"],
+            "lead": ["lead", "principal", "director", "manager", "head", "chief", "vp", "vice president"]
         }
         
         resume_text = " ".join(resume_chunks).lower()
@@ -215,21 +215,25 @@ class EnhancedMatchingService:
         matched = []
         
         for skill in required_skills:
-            if skill.lower() in resume_text:
+            # Check for exact match or partial match
+            skill_lower = skill.lower()
+            if skill_lower in resume_text:
+                matched.append(skill)
+            # Check for common variations
+            elif any(variation in resume_text for variation in [
+                skill_lower.replace('.', ''),
+                skill_lower.replace(' ', ''),
+                skill_lower.replace('-', ' '),
+                skill_lower.replace('_', ' ')
+            ]):
                 matched.append(skill)
         
         return matched
 
     async def _extract_missing_skills(self, required_skills: List[str], resume_chunks: List[str]) -> List[str]:
         """Extract skills that are missing from resume"""
-        resume_text = " ".join(resume_chunks).lower()
-        missing = []
-        
-        for skill in required_skills:
-            if skill.lower() not in resume_text:
-                missing.append(skill)
-        
-        return missing
+        matched_skills = await self._extract_matched_skills(required_skills, resume_chunks)
+        return [skill for skill in required_skills if skill not in matched_skills]
 
     def _determine_confidence_level(self, score: float) -> str:
         """Determine confidence level based on score"""
@@ -254,7 +258,7 @@ class EnhancedMatchingService:
     async def _generate_detailed_explanation(self, job: Job, match: Dict[str, Any]) -> str:
         """Generate detailed explanation using advanced LLM"""
         prompt = PromptTemplate(
-            input_variables=["job_title", "job_requirements", "job_skills", "match_data"],
+            input_variables=["job_title", "job_requirements", "job_skills", "overall_score", "skill_match_score", "experience_match_score", "matched_skills", "missing_skills"],
             template="""
             As an expert HR analyst, provide a detailed assessment of this candidate match:
             
@@ -262,7 +266,7 @@ class EnhancedMatchingService:
             Requirements: {job_requirements}
             Required Skills: {job_skills}
             
-            Candidate Data:
+            Candidate Assessment:
             - Overall Match Score: {overall_score}%
             - Skill Match Score: {skill_match_score}%
             - Experience Match Score: {experience_match_score}%
@@ -270,25 +274,25 @@ class EnhancedMatchingService:
             - Missing Skills: {missing_skills}
             
             Provide a comprehensive 3-4 sentence analysis covering:
-            1. Key strengths of this candidate
-            2. Areas where they excel for this role
-            3. Potential concerns or skill gaps
-            4. Overall recommendation
+            1. Key strengths of this candidate for this role
+            2. Areas where they excel and align with requirements
+            3. Potential concerns or skill gaps to consider
+            4. Overall hiring recommendation with rationale
             
-            Be specific and actionable in your assessment.
+            Be specific, actionable, and professional in your assessment.
             """
         )
         
         try:
             formatted_prompt = prompt.format(
                 job_title=job.title,
-                job_requirements=", ".join(job.requirements),
-                job_skills=", ".join(job.required_skills),
+                job_requirements=", ".join(job.requirements) if job.requirements else "None specified",
+                job_skills=", ".join(job.required_skills) if job.required_skills else "None specified",
                 overall_score=match["overall_score"],
                 skill_match_score=match["skill_match_score"],
                 experience_match_score=match["experience_match_score"],
-                matched_skills=", ".join(match["matched_skills"]),
-                missing_skills=", ".join(match["missing_skills"])
+                matched_skills=", ".join(match["matched_skills"]) if match["matched_skills"] else "None",
+                missing_skills=", ".join(match["missing_skills"]) if match["missing_skills"] else "None"
             )
             
             explanation = await self.llm.ainvoke(formatted_prompt)
@@ -296,14 +300,16 @@ class EnhancedMatchingService:
             
         except Exception as e:
             logger.error(f"Error generating detailed explanation: {e}")
-            return f"Strong candidate with {match['overall_score']}% match score. Key skills aligned: {', '.join(match['matched_skills'][:3])}."
+            # Fallback explanation
+            matched_skills_str = ", ".join(match["matched_skills"][:3]) if match["matched_skills"] else "some relevant skills"
+            return f"Strong candidate with {match['overall_score']}% overall match. Key strengths include {matched_skills_str}. Skill alignment at {match['skill_match_score']}% with experience level matching at {match['experience_match_score']}%. Recommend for {match['recommendation'].replace('_', ' ')} consideration."
 
     async def _save_matches_to_db(self, job_id: str, matches: List[Dict[str, Any]]):
         """Save match results to database"""
         try:
             db = next(get_db())
             
-            # Clear existing matches
+            # Clear existing matches for this job
             db.query(JobResumeMatch).filter(JobResumeMatch.job_id == job_id).delete()
             
             # Save new matches
@@ -330,3 +336,67 @@ class EnhancedMatchingService:
             db.rollback()
         finally:
             db.close()
+
+    async def get_match_analytics(self, job_id: str) -> Dict[str, Any]:
+        """Get analytics for job matches"""
+        try:
+            db = next(get_db())
+            matches = db.query(JobResumeMatch).filter(JobResumeMatch.job_id == job_id).all()
+            
+            if not matches:
+                return {"message": "No matches found", "analytics": {}}
+            
+            scores = [match.overall_score for match in matches]
+            recommendations = {}
+            confidence_levels = {}
+            
+            for match in matches:
+                recommendations[match.recommendation] = recommendations.get(match.recommendation, 0) + 1
+                confidence_levels[match.confidence_level] = confidence_levels.get(match.confidence_level, 0) + 1
+            
+            analytics = {
+                "total_matches": len(matches),
+                "average_score": round(sum(scores) / len(scores), 2),
+                "highest_score": max(scores),
+                "lowest_score": min(scores),
+                "score_distribution": {
+                    "excellent": len([s for s in scores if s >= 80]),
+                    "good": len([s for s in scores if 60 <= s < 80]),
+                    "fair": len([s for s in scores if 40 <= s < 60]),
+                    "poor": len([s for s in scores if s < 40])
+                },
+                "recommendations": recommendations,
+                "confidence_levels": confidence_levels
+            }
+            
+            return {"analytics": analytics}
+            
+        except Exception as e:
+            logger.error(f"Error getting match analytics: {e}")
+            return {"error": str(e)}
+        finally:
+            db.close()
+
+    async def health_check(self) -> Dict[str, Any]:
+        """Perform health check on matching service"""
+        try:
+            # Test LLM connection
+            test_response = await self.llm.ainvoke("Say 'test' in one word.")
+            
+            # Test vector service
+            vector_health = await self.vector_service.health_check()
+            
+            return {
+                "status": "healthy",
+                "llm_model": self.llm.model_id,
+                "test_response": test_response[:20] if test_response else "No response",
+                "vector_service": vector_health.get("status", "unknown"),
+                "cache_service": "healthy" if self.cache_service.redis_client else "unavailable"
+            }
+            
+        except Exception as e:
+            logger.error(f"Matching service health check failed: {e}")
+            return {
+                "status": "unhealthy",
+                "error": str(e)
+            }
